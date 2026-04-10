@@ -1,0 +1,1657 @@
+"""
+Coupled Josephson Junction SDE 参数学习代码
+================================================
+
+本代码实现耦合约瑟夫森结随机微分方程模型的参数学习。
+不使用神经网络，而是直接使用可学习的物理参数来拟合观测数据。
+
+物理模型 (来自 Coupled Josephson Junction.tex):
+-------------------------------------------------
+状态变量: x = [φ₁, v₁, φ₂, v₂]
+  - φ₁, φ₂: 两个结的相位
+  - v₁, v₂: 两个结的相位速度 (v = dφ/dt)
+
+SDE 方程:
+  dφ₁ = v₁ dt
+  dv₁ = [i₁ - β_{J₁}v₁ - sin(φ₁) + κ₁(φ₂ - φ₁)] dt + σ₁ dW₁
+  dφ₂ = v₂ dt
+  dv₂ = [i₂ - β_{J₂}v₂ - sin(φ₂) + κ₂(φ₁ - φ₂)] dt + σ₂ dW₂
+
+待学习参数:
+  - β_{J₁}, β_{J₂}: 阻尼系数 (damping coefficients)
+  - i₁, i₂: 归一化偏置电流 (normalized bias currents)
+  - κ₁, κ₂: 耦合强度 (coupling strengths)
+  - σ₁, σ₂: 噪声强度 (noise intensities)
+
+参考:
+  - 代码结构基于 Stable-Neural-SDEs tutorial 中的工具类
+  - 使用 torchsde 进行 SDE 数值积分
+"""
+
+import os
+import random
+import matplotlib
+import matplotlib.axes
+import numpy as np
+import matplotlib.pyplot as plt
+from sympy import true
+from tqdm import tqdm
+from scipy.stats import entropy
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchsde
+from torch.utils.data import Dataset, DataLoader
+
+
+# =============================================================================
+# 工具函数 (来自 tutorial notebook)
+# =============================================================================
+
+def seed_everything(seed):
+    """
+    设置所有随机种子以确保结果可复现。
+    
+    Args:
+        seed: 随机种子值
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+
+
+# =============================================================================
+# 数据生成: 真实的 Josephson Junction SDE 模拟
+# =============================================================================
+
+class JosephsonJunctionSDE(nn.Module):
+    """
+    耦合约瑟夫森结 SDE 模拟器。
+    使用 torchsde 库求解 SDE。
+    
+    SDE 方程:
+        dφ₁ = v₁ dt
+        dv₁ = [i₁ - β_{J₁}v₁ - sin(φ₁) + κ₁(φ₂ - φ₁)] dt + σ₁ dW₁
+        dφ₂ = v₂ dt
+        dv₂ = [i₂ - β_{J₂}v₂ - sin(φ₂) + κ₂(φ₁ - φ₂)] dt + σ₂ dW₂
+    """
+    
+    def __init__(self, beta1, beta2, i1, i2, kappa1, kappa2, sigma1, sigma2):
+        """
+        初始化物理参数。
+        
+        Args:`
+            beta1, beta2: 阻尼系数
+            i1, i2: 偏置电流
+            kappa1, kappa2: 耦合系数
+            sigma1, sigma2: 噪声强度
+        """
+        super().__init__()
+        
+        # 将标量参数转换为 buffer 或 parameter，使其随模型移动设备
+        self.register_buffer('beta1', torch.tensor(beta1, dtype=torch.float32))
+        self.register_buffer('beta2', torch.tensor(beta2, dtype=torch.float32))
+        self.register_buffer('i1', torch.tensor(i1, dtype=torch.float32))
+        self.register_buffer('i2', torch.tensor(i2, dtype=torch.float32))
+        self.register_buffer('kappa1', torch.tensor(kappa1, dtype=torch.float32))
+        self.register_buffer('kappa2', torch.tensor(kappa2, dtype=torch.float32))
+        self.register_buffer('sigma1', torch.tensor(sigma1, dtype=torch.float32))
+        self.register_buffer('sigma2', torch.tensor(sigma2, dtype=torch.float32))
+        
+        # SDE 类型设置 (torchsde 需要)
+        self.sde_type = "ito"
+        self.noise_type = "diagonal"
+    
+    def f(self, t, y):
+        """
+        漂移项 (drift)。
+        
+        Args:
+            t: 时间标量
+            y: 状态向量 [batch, 4] = [φ₁, v₁, φ₂, v₂]
+            
+        Returns:
+            漂移向量 [batch, 4]
+        """
+        phi1, v1, phi2, v2 = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
+        
+        # dφ₁/dt = v₁
+        d_phi1 = v1
+        
+        # dv₁/dt = i₁ - β₁v₁ - sin(φ₁) + κ₁(φ₂ - φ₁)
+        dv1 = (self.i1 - self.beta1 * v1 - torch.sin(phi1) + self.kappa1 * (phi2 - phi1))
+        
+        # dφ₂/dt = v₂
+        d_phi2 = v2
+        
+        # dv₂/dt = i₂ - β₂v₂ - sin(φ₂) + κ₂(φ₁ - φ₂)
+        dv2 = (self.i2 - self.beta2 * v2 - torch.sin(phi2) + self.kappa2 * (phi1 - phi2))
+        
+        return torch.stack([d_phi1, dv1, d_phi2, dv2], dim=-1)
+    
+    def g(self, t, y):
+        """
+        扩散项 (diffusion)。
+        
+        Args:
+            t: 时间标量
+            y: 状态向量 [batch, 4]
+            
+        Returns:
+            对角噪声 [batch, 4] (对应 diagonal noise type)
+            [0, σ₁, 0, σ₂] - 只有速度方程有噪声
+        """
+        batch_size = y.shape[0]
+        device = y.device
+        
+        # 对角噪声: [0, σ₁, 0, σ₂]
+        noise = torch.zeros(batch_size, 4, device=device)
+        noise[..., 1] = self.sigma1  # dv₁ 的噪声
+        noise[..., 3] = self.sigma2  # dv₂ 的噪声
+        
+        return noise
+    
+    def simulate(self, t_span, n_steps, initial_state, n_samples=1, dt=None, method='euler'):
+        """
+        使用 torchsde 模拟 SDE。
+        
+        Args:
+            t_span: 时间区间 [t_start, t_end]
+            n_steps: 时间步数
+            initial_state: 初始状态 [φ₁₀, v₁₀, φ₂₀, v₂₀]
+            n_samples: 样本数量
+            dt: SDE 积分步长，默认为 None (自动选择)
+            method: 积分方法，默认为 'milstein'
+            
+        Returns:
+            times: 时间点数组 (n_steps,)
+            trajectories: 轨迹数组 (n_samples, n_steps, 4)
+        """
+        
+        # TODO: 检查 n_samples 的参数是否被有效用到。
+        device = initial_state.device if torch.is_tensor(initial_state) else torch.device('cpu')
+        
+        t_start, t_end = t_span
+        times = torch.linspace(t_start, t_end, n_steps, device=device)
+        
+        # 准备初始状态
+        if initial_state.dim() == 1:
+            y0 = initial_state.unsqueeze(0).expand(n_samples, -1)
+        else:
+            y0 = initial_state
+        
+        # 使用 torchsde.sdeint 求解 SDE
+        # 输出 z_t 的 shape 为 [n_steps, batch, channels]
+        with torch.no_grad():
+            trajectories = torchsde.sdeint(
+                sde=self,
+                y0=y0,
+                ts=times,
+                dt=dt if dt is not None else (t_end - t_start) / n_steps,
+                method=method
+            )
+        
+        # 调整维度: [n_steps, batch, 4] -> [batch, n_steps, 4]
+        trajectories = trajectories.permute(1, 0, 2)
+        
+        return times, trajectories
+
+
+# =============================================================================
+# Neural SDE 模型
+# =============================================================================
+
+class LipSwish(nn.Module):
+    """标准 LipSwish：带可学习 β 参数，确保 Lipschitz 常数 ≤ 1"""
+    def __init__(self, beta_init=0.5):
+        super().__init__()
+        # 使用 softplus 逆函数确保 β > 0
+        self.beta_logit = nn.Parameter(
+            torch.log(torch.exp(torch.tensor(beta_init)) - 1)
+        )
+        self.scale = 0.909  # ≈ 1/1.1
+    
+    @property
+    def beta(self):
+        return torch.nn.functional.softplus(self.beta_logit)
+    
+    def forward(self, x):
+        # 标准公式: (x * σ(βx)) / 1.1
+        return self.scale * x * torch.sigmoid(self.beta * x)
+    
+    def extra_repr(self):
+        return f'beta={self.beta.item():.4f}'
+
+
+
+class MLP(nn.Module):
+    """多层感知机"""
+    def __init__(self, in_size, out_size, hidden_dim, num_layers, activation='lipswish'):
+        super().__init__()
+        
+        if activation == 'lipswish':
+            activation_fn = LipSwish()
+        elif activation == 'tanh':
+            activation_fn = nn.Tanh()
+        else:
+            activation_fn = nn.ReLU()
+        
+        layers = [nn.Linear(in_size, hidden_dim), activation_fn]
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(activation_fn)
+        layers.append(nn.Linear(hidden_dim, out_size))
+        
+        self._model = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self._model(x)
+
+
+class NeuralJosephsonSDE(nn.Module):
+    """
+    神经约瑟夫森结 SDE 模型。
+    
+    使用神经网络来学习 SDE 的漂移项 f(t, y) 和扩散项 g(t, y)。
+    这是一个通用的 Neural SDE 实现，不假设具体的物理形式。
+    """
+    
+    def __init__(self, state_dim=4, hidden_dim=64, num_layers=3, activation='lipswish'):
+        """
+        初始化 Neural SDE。
+        
+        Args:
+            state_dim: 状态空间维度 (对于耦合JJ，是 4: [φ₁, v₁, φ₂, v₂])
+            hidden_dim: 隐藏层维度
+            num_layers: 神经网络层数
+            activation: 激活函数类型 ('lipswish', 'tanh', 'relu')
+        """
+        super().__init__()
+        
+        self.state_dim = state_dim
+        self.hidden_dim = hidden_dim
+        
+        # SDE 类型设置 (torchsde 需要)
+        self.sde_type = "ito"
+        self.noise_type = "diagonal"
+        
+        # 漂移项网络 f(y): 输入 [y] -> 输出漂移 [state_dim]
+        # 输入维度: state_dim (状态)
+        #! 移除了时间输入
+        self.f_net = MLP(
+            in_size=state_dim,
+            out_size=state_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            activation=activation
+        )
+        
+        # 扩散项网络 g(y): 输入 [y] -> 输出扩散 [state_dim]
+        # 使用 softplus 确保输出为正
+        #! 移除了时间输入
+        self.g_net = MLP(
+            in_size=state_dim,
+            out_size=state_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            activation=activation
+        )
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化网络权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def f(self, t, y):
+        """
+        漂移项 (drift)。
+        
+        Args:
+            t: 时间
+            y: 状态向量 [batch, state_dim]
+            
+        Returns:
+            漂移向量 [batch, state_dim]
+        """
+        f_out = self.f_net(y)
+        # 限制漂移项的范围，避免数值爆炸
+        return torch.clamp(f_out, min=-100.0)
+    
+    def g(self, t, y):
+        """
+        扩散项 (diffusion)。
+        
+        使用 softplus 确保扩散系数为正。
+        
+        Args:
+            t: 时间
+            y: 状态向量 [batch, state_dim]
+            
+        Returns:
+            对角噪声 [batch, state_dim]
+        """
+        # 使用 softplus 确保正数输出，但限制最小值避免数值问题
+        g_out = torch.nn.functional.softplus(self.g_net(y))
+        # 限制最小值和最大值，避免数值不稳定
+        return torch.clamp(g_out, min=1e-6)
+    
+    def forward(self, initial_states, times, dt=None, method='euler'):
+        """
+        前向传播: 从初始状态积分 SDE。
+        
+        Args:
+            initial_states: 初始状态 [n_samples, state_dim]
+            times: 时间点 [n_steps]
+            dt: 积分步长
+            method: 积分方法 ('euler', 'milstein', 'srk')
+            
+        Returns:
+            trajectories: 轨迹 [n_samples, n_steps, state_dim]
+        """
+        # 使用 torchsde.sdeint 求解 SDE
+        # 注意: 对于 Neural SDE，euler 方法通常更稳定
+        trajectories = torchsde.sdeint(
+            sde=self,
+            y0=initial_states,
+            ts=times,
+            dt=dt if dt is not None else (times[-1] - times[0]) / len(times),
+            method=method
+        )
+        
+        # 调整维度: [n_steps, batch, state_dim] -> [batch, n_steps, state_dim]
+        return trajectories.permute(1, 0, 2)
+
+
+# =============================================================================
+# 数据集类
+# =============================================================================
+
+class JosephsonDataset(Dataset):
+    """
+    约瑟夫森结轨迹数据集。
+    """
+    
+    def __init__(self, trajectories, times):
+        """
+        Args:
+            trajectories: 轨迹数据 [n_samples, n_steps, 4]
+            times: 时间点 [n_steps]
+        """
+        self.trajectories = trajectories
+        self.times = times
+    
+    def __len__(self):
+        return len(self.trajectories)
+    
+    def __getitem__(self, idx):
+        return self.trajectories[idx], self.times
+
+
+# =============================================================================
+# 损失函数 (参考 LieTrotterSDE 实现)
+# =============================================================================
+
+# @torch.no_grad()
+def compute_euler_pseudo_likelihood_loss(true_trajectories, pred_trajectories, dt, model:NeuralJosephsonSDE):
+    """
+    Euler-Maruyama 伪似然损失。
+    
+    基于 Euler-Maruyama 离散化的负对数似然，假设残差服从高斯分布。
+    参考: loss_terms.py 中的 euler_loss
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+        dt: 时间步长
+        
+    Returns:
+        euler_loss: Euler-Maruyama 伪似然损失
+    """
+    device = true_trajectories.device
+    dtype = true_trajectories.dtype
+    
+    # 确保 dt 是 tensor 且在正确设备上
+    if not isinstance(dt, torch.Tensor):
+        dt = torch.tensor(dt, device=device, dtype=dtype)
+    else:
+        dt = dt.to(device=device, dtype=dtype)
+    
+    # 计算增量 dX = X_{t+1} - X_t
+    x_ = true_trajectories[:, :-1, :].requires_grad_(True)
+    dx_ = (true_trajectories[:, 1:, :] - x_).detach()
+    
+    var_x_ = model.g(None, x_)
+    bias_x_ = model.f(None, x_)
+    
+    euler_loss = 0.5 * torch.sum(
+        ((bias_x_ - dx_/dt) / torch.sqrt(var_x_/dt))**2
+    ) + 0.5 * torch.sum(torch.log(var_x_**2))
+    
+    
+    # 残差: (dX_true - dX_pred) / sqrt(dt)
+    # 使用 clamp 避免除以过小的数
+    # dt_safe = torch.clamp(dt, min=1e-8)
+    # residuals = (true_increments - pred_increments) / torch.sqrt(dt_safe)
+    
+    # # 负对数似然: -log(2*pi*dt) + residuals^2/(2*dt)
+    # # 简化为: -log(2*pi*dt) + mean(residuals^2)
+    # log_term = torch.log(2 * torch.tensor(3.14159265359, device=device, dtype=dtype) * dt_safe)
+    # variance_penalty = -log_term
+    # residual_penalty = torch.mean(residuals ** 2)
+    
+    # # 数值稳定性检查
+    # if torch.isnan(residual_penalty) or torch.isinf(residual_penalty):
+    #     residual_penalty = torch.tensor(0.0, device=device, dtype=dtype)
+    
+    # euler_loss = variance_penalty + residual_penalty
+    
+    # 最终检查
+    if torch.isnan(euler_loss) or torch.isinf(euler_loss):
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    
+    return euler_loss
+
+
+def compute_moment_loss(true_trajectories, pred_trajectories):
+    """
+    矩匹配损失。匹配均值和方差。
+    
+    参考: train.py 中的 moment_term 实现
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+        
+    Returns:
+        moment_loss: 矩匹配损失
+    """
+    # 检查输入是否包含 nan
+    if torch.isnan(true_trajectories).any() or torch.isnan(pred_trajectories).any():
+        return torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    
+    # 计算均值 (沿样本维度)
+    # [n_samples, n_steps, n_dims] --> [n_steps, n_dims]
+    true_mean = torch.mean(true_trajectories, dim=0) #.detach()  
+    pred_mean = torch.mean(pred_trajectories, dim=0) #.requires_grad_(True)
+    
+    # 计算方差
+    true_var = torch.var(true_trajectories, dim=0, unbiased=True) #.detach()
+    pred_var = torch.var(pred_trajectories, dim=0, unbiased=True) #.requires_grad_(True)
+    
+    # 均值损失
+    mean_loss = torch.mean((pred_mean - true_mean) ** 2)
+    
+    # 方差损失 (使用 log 来降低大数值的影响)
+    # 对方差取 log 可以使损失更稳定
+    # log_true_var = torch.log(true_var + 1e-8)
+    # log_pred_var = torch.log(pred_var + 1e-8)
+    # var_loss = torch.mean((log_pred_var - log_true_var) ** 2)
+    var_loss = torch.mean((pred_var - true_var) ** 2)
+    
+    # 数值稳定性检查
+    if torch.isnan(mean_loss):
+        mean_loss = torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    if torch.isnan(var_loss):
+        var_loss = torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    
+    moment_loss = mean_loss + var_loss
+    
+    return moment_loss
+
+#TODO: Check this function
+def compute_autocorrelation_loss(true_trajectories, pred_trajectories, max_lags=10):
+    """
+    自相关损失。匹配时间序列的自相关性。
+    
+    参考: train.py 中的 autocorrelation_term 实现
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+        max_lags: 最大滞后阶数
+        
+    Returns:
+        autocorr_loss: 自相关损失
+    """
+    # 检查输入是否包含 nan
+    if torch.isnan(true_trajectories).any() or torch.isnan(pred_trajectories).any():
+        return torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    
+    n_samples, n_steps, n_dims = true_trajectories.shape
+    device = true_trajectories.device
+    
+    def compute_autocorr(x, max_lags):
+        """
+        计算自相关函数。
+        x: [n_samples, n_steps]
+        """
+        n_samples, n_steps = x.shape
+        
+        # 中心化
+        x_centered = x - torch.mean(x, dim=1, keepdim=True)
+        
+        # 计算方差
+        var = torch.mean(x_centered ** 2, dim=1)  # [n_samples]
+        var = torch.clamp(var, min=1e-6)  # 避免除零
+        
+        autocorrs = []
+        for lag in range(min(max_lags + 1, n_steps)):
+            if lag == 0:
+                autocorr = torch.ones(n_samples, device=device, dtype=x.dtype)
+            else:
+                c_lag = torch.mean(x_centered[:, :-lag] * x_centered[:, lag:], dim=1)
+                autocorr = c_lag / var
+            autocorrs.append(autocorr)
+        
+        return torch.stack(autocorrs, dim=1)  # [n_samples, max_lags+1]
+    
+    total_autocorr_loss = 0.0
+    
+    for dim in range(n_dims):
+        true_autocorr = compute_autocorr(true_trajectories[:, :, dim], max_lags)
+        pred_autocorr = compute_autocorr(pred_trajectories[:, :, dim], max_lags)
+        
+        # 检查是否有 nan
+        if torch.isnan(true_autocorr).any() or torch.isnan(pred_autocorr).any():
+            continue
+        
+        # 平均自相关（沿样本维度）
+        true_autocorr_mean = torch.mean(true_autocorr, dim=0)
+        pred_autocorr_mean = torch.mean(pred_autocorr, dim=0)
+        
+        # MSE 损失
+        autocorr_loss = torch.mean((pred_autocorr_mean - true_autocorr_mean) ** 2)
+        
+        # 数值稳定性检查
+        if not torch.isnan(autocorr_loss) and not torch.isinf(autocorr_loss):
+            total_autocorr_loss += autocorr_loss
+    
+    return total_autocorr_loss / max(n_dims, 1)
+
+
+def compute_wasserstein_1d(u_values, v_values):
+    """
+    计算一维 Wasserstein-1 距离。
+    
+    参考: loss_terms.py 中的 tf_wasserstein1D
+    
+    Args:
+        u_values: 第一组样本 [n_samples]
+        v_values: 第二组样本 [n_samples]
+        
+    Returns:
+        wasserstein_distance: Wasserstein-1 距离
+    """
+    # 检查输入是否包含 nan
+    if torch.isnan(u_values).any() or torch.isnan(v_values).any():
+        return torch.tensor(0.0, device=u_values.device, dtype=u_values.dtype)
+    
+    # 排序
+    u_sorted, _ = torch.sort(u_values)
+    v_sorted, _ = torch.sort(v_values)
+    
+    # Wasserstein-1 距离 = L1 距离 between sorted samples
+    # 对于一维分布，W_1 = integral |F_u(x) - F_v(x)| dx = mean |u_sorted - v_sorted|
+    min_len = min(len(u_sorted), len(v_sorted))
+    u_sorted = u_sorted[:min_len]
+    v_sorted = v_sorted[:min_len]
+    
+    w_dist = torch.mean(torch.abs(u_sorted - v_sorted))
+    
+    # 数值稳定性检查
+    if torch.isnan(w_dist) or torch.isinf(w_dist):
+        return torch.tensor(0.0, device=u_values.device, dtype=u_values.dtype)
+    
+    return w_dist
+
+
+def compute_wasserstein_loss(true_trajectories, pred_trajectories, num_points=5):
+    """
+    Wasserstein 距离损失。
+    
+    在随机选择的时间点计算各维度的 Wasserstein 距离。
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+        num_points: 随机选择的时间点数量
+        
+    Returns:
+        wasserstein_loss: Wasserstein 损失
+    """
+    n_samples, n_steps, n_dims = true_trajectories.shape
+    device = true_trajectories.device
+    
+    # 随机选择时间点（排除第一个点）
+    if num_points >= n_steps - 1:
+        time_indices = torch.arange(1, n_steps, device=device)
+    else:
+        time_indices = torch.randperm(n_steps - 1, device=device)[:num_points] + 1
+    
+    total_w_dist = 0.0
+    num_comparisons = 0
+    
+    for t_idx in time_indices:
+        for dim_idx in range(n_dims):
+            true_vals = true_trajectories[:, t_idx, dim_idx]
+            pred_vals = pred_trajectories[:, t_idx, dim_idx]
+            
+            w_dist = compute_wasserstein_1d(true_vals, pred_vals)
+            total_w_dist += w_dist
+            num_comparisons += 1
+    
+    if num_comparisons > 0:
+        return total_w_dist / num_comparisons
+    else:
+        return torch.tensor(0.0, device=device)
+
+
+def compute_path_mse_loss(true_trajectories, pred_trajectories):
+    """
+    路径级 MSE 损失。
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+        
+    Returns:
+        mse_loss: MSE 损失
+    """
+    # 检查输入是否包含 nan
+    if torch.isnan(true_trajectories).any() or torch.isnan(pred_trajectories).any():
+        return torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    
+    mse_loss = torch.mean((pred_trajectories - true_trajectories) ** 2)
+    
+    # 数值稳定性检查
+    if torch.isnan(mse_loss) or torch.isinf(mse_loss):
+        return torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    
+    return mse_loss
+
+
+def compute_soft_histogram_kl_loss(true_trajectories, pred_trajectories, 
+                                    num_points=5, n_bins=10, sigma=0.1):
+    """
+    软直方图 KL 散度损失（随机时间片）。
+    
+    参考 simple OU process - Neural SDE.ipynb 中的 SoftHistogramKL 实现。
+    在随机选择的时间点上计算真实和预测轨迹的分布 KL 散度。
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+        num_points: 随机选择的时间点数量
+        n_bins: 直方图的 bin 数量
+        sigma: 软分箱的高斯带宽
+        
+    Returns:
+        kl_loss: KL 散度损失
+    """
+    # 检查输入是否包含 nan
+    if torch.isnan(true_trajectories).any() or torch.isnan(pred_trajectories).any():
+        return torch.tensor(0.0, device=true_trajectories.device, dtype=true_trajectories.dtype)
+    
+    n_samples, n_steps, n_dims = true_trajectories.shape
+    device = true_trajectories.device
+    dtype = true_trajectories.dtype
+    
+    # 随机选择时间点（排除第一个点，因为初始条件相同）
+    if num_points >= n_steps - 1:
+        time_indices = torch.arange(1, n_steps, device=device)
+    else:
+        time_indices = torch.randperm(n_steps - 1, device=device)[:num_points] + 1
+    
+    total_kl = 0.0
+    num_comparisons = 0
+    
+    # 对每个时间点计算 KL 散度
+    for t_idx in time_indices:
+        # 在该时间点收集所有样本的所有维度
+        true_vals = true_trajectories[:, t_idx, :]  # [n_samples, n_dims]
+        pred_vals = pred_trajectories[:, t_idx, :]  # [n_samples, n_dims]
+        
+        # 对每个维度分别计算 KL
+        for dim_idx in range(n_dims):
+            true_dim = true_vals[:, dim_idx]
+            pred_dim = pred_vals[:, dim_idx]
+            
+            # 只有当数据有足够变化时才计算 KL
+            if (true_dim.std() < 1e-6) or (pred_dim.std() < 1e-6):
+                continue
+            
+            # 动态确定直方图范围
+            vmin = min(true_dim.min().item(), pred_dim.min().item()) - 0.1
+            vmax = max(true_dim.max().item(), pred_dim.max().item()) + 0.1
+            
+            # 创建 bin 中心
+            bins = torch.linspace(vmin, vmax, n_bins, device=device, dtype=dtype)
+            
+            # 软直方图计算
+            def soft_histogram(values, bins, sigma):
+                """使用高斯核计算软直方图"""
+                # values: [n_samples], bins: [n_bins]
+                diff = torch.abs(values.unsqueeze(1) - bins.unsqueeze(0))  # [n_samples, n_bins]
+                weights = torch.exp(-diff.pow(2) / (2 * sigma ** 2))
+                return weights.sum(dim=0)  # [n_bins]
+            
+            true_hist = soft_histogram(true_dim, bins, sigma)
+            pred_hist = soft_histogram(pred_dim, bins, sigma)
+            
+            # 归一化为概率分布
+            true_prob = (true_hist + 1e-6) / (true_hist.sum() + 1e-6 * n_bins)
+            pred_prob = (pred_hist + 1e-6) / (pred_hist.sum() + 1e-6 * n_bins)
+            
+            # 计算 KL(True || Pred) = sum(true * log(true/pred))
+            # 使用 log 前加 clip 避免 log(0)
+            pred_prob_clipped = torch.clamp(pred_prob, min=1e-8)
+            true_prob_clipped = torch.clamp(true_prob, min=1e-8)
+            
+            kl = torch.sum(true_prob * torch.log(true_prob_clipped / pred_prob_clipped))
+            
+            # 数值稳定性检查
+            if not torch.isnan(kl) and not torch.isinf(kl):
+                # 时间加权：后期时间点更重要
+                weight = max(1.0, (t_idx.item() / n_steps) ** 0.5)
+                total_kl += kl * weight
+                num_comparisons += 1
+    
+    if num_comparisons > 0:
+        avg_kl = total_kl / num_comparisons
+        # 最终检查
+        if torch.isnan(avg_kl) or torch.isinf(avg_kl):
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        return avg_kl
+    else:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+
+
+class LossFunction(nn.Module):
+    """
+    综合损失函数，支持多种损失项的灵活组合。
+    
+    参考 LieTrotterSDE 的 loss_term_dict 设计
+    """
+    
+    def __init__(self, 
+                 mse_weight=1.0,
+                 euler_weight=0.0,
+                 moment_weight=0.0,
+                 autocorr_weight=0.0,
+                 wasserstein_weight=0.0,
+                 kl_weight=0.0,           # KL 散度损失权重
+                 dt=0.01,
+                 max_lags=10,
+                 wasserstein_points=5,
+                 kl_points=5,              # KL 采样时间点数
+                 kl_bins=10,               # KL 直方图 bin 数
+                 kl_sigma=0.1,              # KL 软分箱带宽
+                 model=None):            #
+        """
+        Args:
+            mse_weight: MSE 损失权重
+            euler_weight: Euler-Maruyama 伪似然权重
+            moment_weight: 矩匹配损失权重
+            autocorr_weight: 自相关损失权重
+            wasserstein_weight: Wasserstein 距离权重
+            kl_weight: 软直方图 KL 散度损失权重
+            dt: 时间步长（用于 Euler 损失）
+            max_lags: 最大滞后阶数（用于自相关损失）
+            wasserstein_points: Wasserstein 采样点数
+            kl_points: KL 散度采样时间点数
+            kl_bins: KL 散度直方图 bin 数
+            kl_sigma: KL 散度软分箱带宽
+        """
+        super().__init__()
+        self.mse_weight = mse_weight
+        self.euler_weight = euler_weight
+        self.moment_weight = moment_weight
+        self.autocorr_weight = autocorr_weight
+        self.wasserstein_weight = wasserstein_weight
+        self.kl_weight = kl_weight
+        self.dt = dt
+        self.max_lags = max_lags
+        self.wasserstein_points = wasserstein_points
+        self.kl_points = kl_points
+        self.kl_bins = kl_bins
+        self.kl_sigma = kl_sigma
+        
+        self.model = model
+        
+        self.loss_names = ['mse', 'euler', 'moment', 'autocorr', 'wasserstein', 'kl']
+    
+    def forward(self, true_trajectories, pred_trajectories):
+        """
+        计算综合损失。
+        
+        Args:
+            true_trajectories: 真实轨迹 [n_samples, n_steps, n_dims]
+            pred_trajectories: 预测轨迹 [n_samples, n_steps, n_dims]
+            
+        Returns:
+            total_loss: 总损失
+            loss_dict: 各损失项的字典
+        """
+        device = true_trajectories.device
+        dtype = true_trajectories.dtype
+        
+        # 检查输入是否包含 nan
+        if torch.isnan(true_trajectories).any() or torch.isnan(pred_trajectories).any():
+            loss_dict = {name: 0.0 for name in self.loss_names}
+            loss_dict['total'] = 0.0
+            return torch.tensor(0.0, device=device, dtype=dtype), loss_dict
+        
+        loss_dict = {}
+        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        
+        # MSE 损失
+        if self.mse_weight > 0:
+            mse_loss = compute_path_mse_loss(true_trajectories, pred_trajectories)
+            if not torch.isnan(mse_loss) and not torch.isinf(mse_loss):
+                loss_dict['mse'] = mse_loss.item()
+                total_loss += self.mse_weight * mse_loss
+            else:
+                loss_dict['mse'] = 0.0
+        else:
+            loss_dict['mse'] = 0.0
+        
+        # Euler-Maruyama 伪似然
+        if self.euler_weight > 0:
+            euler_loss = compute_euler_pseudo_likelihood_loss(
+                true_trajectories, pred_trajectories, self.dt, model=self.model
+            )
+            if not torch.isnan(euler_loss) and not torch.isinf(euler_loss):
+                loss_dict['euler'] = euler_loss.item()
+                total_loss += self.euler_weight * euler_loss
+            else:
+                loss_dict['euler'] = 0.0
+        else:
+            loss_dict['euler'] = 0.0
+        
+        # 矩匹配损失
+        if self.moment_weight > 0:
+            moment_loss = compute_moment_loss(true_trajectories, pred_trajectories)
+            if not torch.isnan(moment_loss) and not torch.isinf(moment_loss):
+                loss_dict['moment'] = moment_loss.item()
+                total_loss += self.moment_weight * moment_loss
+            else:
+                loss_dict['moment'] = 0.0
+        else:
+            loss_dict['moment'] = 0.0
+        
+        # 自相关损失
+        if self.autocorr_weight > 0:
+            autocorr_loss = compute_autocorrelation_loss(
+                true_trajectories, pred_trajectories, self.max_lags
+            )
+            if not torch.isnan(autocorr_loss) and not torch.isinf(autocorr_loss):
+                loss_dict['autocorr'] = autocorr_loss.item()
+                total_loss += self.autocorr_weight * autocorr_loss
+            else:
+                loss_dict['autocorr'] = 0.0
+        else:
+            loss_dict['autocorr'] = 0.0
+        
+        # Wasserstein 距离
+        if self.wasserstein_weight > 0:
+            wasserstein_loss = compute_wasserstein_loss(
+                true_trajectories.detach(),  # 不对真实数据求梯度
+                pred_trajectories,
+                self.wasserstein_points
+            )
+            if not torch.isnan(wasserstein_loss) and not torch.isinf(wasserstein_loss):
+                loss_dict['wasserstein'] = wasserstein_loss.item()
+                total_loss += self.wasserstein_weight * wasserstein_loss
+            else:
+                loss_dict['wasserstein'] = 0.0
+        else:
+            loss_dict['wasserstein'] = 0.0
+        
+        # 软直方图 KL 散度损失（随机时间片）
+        if self.kl_weight > 0:
+            kl_loss = compute_soft_histogram_kl_loss(
+                true_trajectories.detach(),  # 不对真实数据求梯度
+                pred_trajectories,
+                num_points=self.kl_points,
+                n_bins=self.kl_bins,
+                sigma=self.kl_sigma
+            )
+            if not torch.isnan(kl_loss) and not torch.isinf(kl_loss):
+                loss_dict['kl'] = kl_loss.item()
+                total_loss += self.kl_weight * kl_loss
+            else:
+                loss_dict['kl'] = 0.0
+        else:
+            loss_dict['kl'] = 0.0
+        
+        # 最终检查
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            for key in loss_dict:
+                loss_dict[key] = 0.0
+        
+        loss_dict['total'] = total_loss.item()
+        
+        return total_loss, loss_dict
+
+
+def compute_trajectory_loss(model: NeuralJosephsonSDE, initial_states, true_trajectories, times, 
+                            loss_fn, dt=0.01, n_samples_per_batch=None):
+    """
+    计算模型生成的轨迹与真实轨迹之间的损失。
+    
+    Args:
+        model: NeuralJosephsonSDE 模型
+        initial_states: 初始状态 [n_samples, 4]
+        true_trajectories: 真实轨迹 [n_samples, n_steps, 4]
+        times: 时间点 [n_steps]
+        loss_fn: LossFunction 实例
+        dt: SDE 积分步长
+        n_samples_per_batch: 每次生成的样本数（用于减少内存使用），None 表示全部
+        
+    Returns:
+        total_loss: 总损失
+        loss_dict: 各损失项的字典
+        pred_trajectories: 预测的轨迹
+    """
+    n_samples = initial_states.shape[0]
+    device = initial_states.device
+    
+    # 使用 Euler 方法（更稳定）
+    sde_method = 'euler'
+    
+    try:
+        # 如果指定了分批生成，则分批进行
+        if n_samples_per_batch is not None and n_samples > n_samples_per_batch:
+            all_pred_trajectories = []
+            for i in range(0, n_samples, n_samples_per_batch):
+                end_idx = min(i + n_samples_per_batch, n_samples)
+                batch_initial = initial_states[i:end_idx]
+                
+                pred_batch = torchsde.sdeint(
+                    sde=model,
+                    y0=batch_initial,
+                    ts=times,
+                    dt=dt,
+                    method=sde_method
+                )
+                # [n_steps, batch, 4] -> [batch, n_steps, 4]
+                pred_batch = pred_batch.permute(1, 0, 2)
+                all_pred_trajectories.append(pred_batch)
+            
+            pred_trajectories = torch.cat(all_pred_trajectories, dim=0)
+        else:
+            # 使用 torchsde.sdeint 求解 SDE
+
+            pred_trajectories = torchsde.sdeint(
+                sde=model,
+                y0=initial_states,
+                ts=times,
+                dt=dt,
+                method=sde_method
+            )
+            
+            # 调整维度: [n_steps, batch, 4] -> [batch, n_steps, 4]
+            pred_trajectories = pred_trajectories.permute(1, 0, 2)
+        
+        # 检查预测轨迹是否包含 nan
+        if torch.isnan(pred_trajectories).any() or torch.isinf(pred_trajectories).any():
+            # 如果预测轨迹包含 nan，返回零损失和与真实轨迹相同的预测
+            loss_dict = {name: 0.0 for name in loss_fn.loss_names}
+            loss_dict['total'] = 0.0
+            return torch.tensor(0.0, device=device, dtype=true_trajectories.dtype), loss_dict, true_trajectories.clone()
+        
+        # 计算损失
+        total_loss, loss_dict = loss_fn(true_trajectories, pred_trajectories)
+        
+    except Exception as e:
+        # 如果 SDE 积分失败，返回零损失
+        print(f"Warning: SDE integration failed with error: {e}")
+        loss_dict = {name: 0.0 for name in loss_fn.loss_names}
+        loss_dict['total'] = 0.0
+        return torch.tensor(0.0, device=device, dtype=true_trajectories.dtype), loss_dict, true_trajectories.clone()
+    
+    return total_loss, loss_dict, pred_trajectories
+
+
+def train_epoch(model, dataloader, optimizer, times, loss_fn, dt=0.01, 
+                n_samples_per_batch=None, grad_clip_config=None, debug=False):
+    """
+    训练一个 epoch。
+    
+    Args:
+        model: 参数化 SDE 模型
+        dataloader: 数据加载器
+        optimizer: 优化器
+        times: 时间点
+        loss_fn: LossFunction 实例
+        dt: SDE 积分步长
+        n_samples_per_batch: 每次生成的样本数
+        grad_clip_config: 梯度裁剪配置字典 {'enabled': bool, 'max_norm': float}
+        debug: 是否打印调试信息
+        
+    Returns:
+        avg_losses: 平均损失字典
+        avg_grad_norm: 平均梯度范数
+    """
+    model.train()
+    total_losses = {name: 0.0 for name in loss_fn.loss_names + ['total']}
+    total_grad_norm = 0.0
+    n_batches = 0
+    
+    for batch_idx, (batch_trajectories, _) in enumerate(dataloader):
+        device = batch_trajectories.device
+        batch_trajectories = batch_trajectories.to(device)
+        
+        # 初始状态
+        initial_states = batch_trajectories[:, 0, :]
+        
+        # 计算损失
+        print(model.__dict__.keys())
+        print(model.__class__.__name__)
+        
+        loss, loss_dict, _ = compute_trajectory_loss(
+            model, initial_states, batch_trajectories, times, 
+            loss_fn, dt, n_samples_per_batch
+        )
+        
+        
+        # 调试信息：第一个 batch 打印损失详情
+        if debug and batch_idx == 0:
+            print(f"\n[Debug] Batch 0 loss details:")
+            for name, value in loss_dict.items():
+                print(f"  {name}: {value:.6f}")
+            print(f"  Total loss: {loss.item():.6f}")
+        
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # 计算梯度范数（在裁剪之前）
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+        total_grad_norm += grad_norm.item()
+        
+        # 梯度裁剪
+        if grad_clip_config is not None and grad_clip_config.get('enabled', False):
+            max_norm = grad_clip_config.get('max_norm', 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        
+        optimizer.step()
+        
+        for key, value in loss_dict.items():
+            total_losses[key] += value
+        n_batches += 1
+    
+    # 计算平均损失和梯度范数
+    avg_losses = {key: value / n_batches for key, value in total_losses.items()}
+    avg_grad_norm = total_grad_norm / n_batches if n_batches > 0 else 0.0
+    
+    return avg_losses, avg_grad_norm
+
+
+def evaluate(model, dataloader, times, loss_fn, dt=0.01, n_samples_per_batch=None):
+    """
+    评估模型。
+    
+    Args:
+        model: 参数化 SDE 模型
+        dataloader: 数据加载器
+        times: 时间点
+        loss_fn: LossFunction 实例
+        dt: SDE 积分步长
+        n_samples_per_batch: 每次生成的样本数
+        
+    Returns:
+        avg_losses: 平均损失字典
+        all_preds: 所有预测轨迹
+        all_trues: 所有真实轨迹
+    """
+    model.eval()
+    total_losses = {name: 0.0 for name in loss_fn.loss_names + ['total']}
+    n_batches = 0
+    all_preds = []
+    all_trues = []
+    
+    with torch.no_grad():
+        for batch_trajectories, _ in dataloader:
+            device = batch_trajectories.device
+            batch_trajectories = batch_trajectories.to(device)
+            
+            initial_states = batch_trajectories[:, 0, :]
+            
+            _, loss_dict, pred_trajectories = compute_trajectory_loss(
+                model, initial_states, batch_trajectories, times,
+                loss_fn, dt, n_samples_per_batch
+            )
+            
+            for key, value in loss_dict.items():
+                total_losses[key] += value
+            n_batches += 1
+            
+            all_preds.append(pred_trajectories.cpu())
+            all_trues.append(batch_trajectories.cpu())
+    
+    avg_losses = {key: value / n_batches for key, value in total_losses.items()}
+    all_preds = torch.cat(all_preds, dim=0)
+    all_trues = torch.cat(all_trues, dim=0)
+    
+    return avg_losses, all_preds, all_trues
+
+
+# =============================================================================
+# 可视化函数 (参考 coupled_junction_sdeint.py)
+# =============================================================================
+
+def plot_trajectories_comparison(true_trajectories, pred_trajectories, times, 
+                                   n_samples=3, save_path=None, compare=False):
+    """
+    可视化真实轨迹和预测轨迹的对比。
+    参考 coupled_junction_sdeint.py 的绘图风格，使用 2x3 布局。
+    
+    Args:
+        true_trajectories: 真实轨迹 [n_samples, n_steps, 4]
+        pred_trajectories: 预测轨迹 [n_samples, n_steps, 4]
+        times: 时间点
+        n_samples: 要绘制的样本数
+        save_path: 保存路径，如果为 None 则显示
+    """
+    from matplotlib import axes
+    
+    # 转换为 numpy
+    times_np = times.cpu().numpy() if torch.is_tensor(times) else times
+    true_np = true_trajectories[:n_samples].cpu().numpy() if torch.is_tensor(true_trajectories) else true_trajectories[:n_samples]
+    pred_np = pred_trajectories[:n_samples].cpu().numpy() if torch.is_tensor(pred_trajectories) else pred_trajectories[:n_samples]
+    
+    # 提取单个样本的数据（取第一个样本用于对比）
+    true_sample = true_np[0]  # [n_steps, 4]
+    pred_sample = pred_np[0]  # [n_steps, 4]
+    
+    phi1_true, v1_true, phi2_true, v2_true = true_sample[:, 0], true_sample[:, 1], true_sample[:, 2], true_sample[:, 3]
+    phi1_pred, v1_pred, phi2_pred, v2_pred = pred_sample[:, 0], pred_sample[:, 1], pred_sample[:, 2], pred_sample[:, 3]
+    
+    # 创建 2x3 子图
+    fig, axs = plt.subplots(2, 3, figsize=(15, 10), dpi=150)
+    axs = axs.flatten()
+    
+    # axs[0]: 相位演化对比 (phi1, phi2)
+    axs[0].plot(times_np, phi1_true, 'b-', alpha=0.7, label=r'$\phi_1$ (True)')
+    axs[0].plot(times_np, phi2_true, 'g-', alpha=0.7, label=r'$\phi_2$ (True)')
+    if compare:
+        axs[0].plot(times_np, phi1_pred, 'b--', alpha=0.7, label=r'$\phi_1$ (Pred)')
+        axs[0].plot(times_np, phi2_pred, 'g--', alpha=0.7, label=r'$\phi_2$ (Pred)')    
+        axs[0].legend(loc='best', fontsize=8)
+    axs[0].grid(True, alpha=0.3)
+    axs[0].set_xlabel("Time")
+    axs[0].set_ylabel(r"Phase $\phi$")
+    axs[0].set_title("Phase Evolution")
+    
+    # axs[1]: 速度演化对比 (v1, v2)
+    axs[1].plot(times_np, v1_true, 'b-', alpha=0.7, label=r'$v_1$ (True)')
+    axs[1].plot(times_np, v2_true, 'g-', alpha=0.7, label=r'$v_2$ (True)')
+    if compare:
+        axs[1].plot(times_np, v1_pred, 'b--', alpha=0.7, label=r'$v_1$ (Pred)')
+        axs[1].plot(times_np, v2_pred, 'g--', alpha=0.7, label=r'$v_2$ (Pred)')
+        axs[1].legend(loc='best', fontsize=8)
+    axs[1].grid(True, alpha=0.3)
+    axs[1].set_xlabel("Time")
+    axs[1].set_ylabel("Velocity $v$")
+    axs[1].set_title("Velocity Evolution")
+    
+    # axs[2]: 相空间轨迹对比
+    axs[2].plot(phi1_true, v1_true, 'b-', alpha=0.5, label='Junction 1 (True)')
+    axs[2].plot(phi2_true, v2_true, 'g-', alpha=0.5, label='Junction 2 (True)')
+    if compare:
+        axs[2].plot(phi1_pred, v1_pred, 'b--', alpha=0.5, label='Junction 1 (Pred)')
+        axs[2].plot(phi2_pred, v2_pred, 'g--', alpha=0.5, label='Junction 2 (Pred)')
+        axs[2].legend(loc='best', fontsize=8)
+    axs[2].grid(True, alpha=0.3)
+    axs[2].set_xlabel(r"$\phi$")
+    axs[2].set_ylabel(r"$v$")
+    axs[2].set_title("Phase Space Trajectories")
+    
+    # axs[3]: 相位相关性 (phi1 vs phi2)
+    axs[3].plot(phi1_true, phi2_true, 'b-', alpha=0.5, label='True')
+    if compare:
+        axs[3].plot(phi1_pred, phi2_pred, 'r--', alpha=0.5, label='Pred')
+        axs[3].legend(loc='best', fontsize=8)
+    axs[3].grid(True, alpha=0.3)
+    axs[3].set_xlabel(r"$\phi_1$")
+    axs[3].set_ylabel(r"$\phi_2$")
+    axs[3].set_title("Phase Correlation")
+    
+    # axs[4]: 相位差 (phi1 - phi2)
+    axs[4].plot(times_np, phi1_true - phi2_true, 'b-', alpha=0.7, label='True')
+    if compare:
+        axs[4].plot(times_np, phi1_pred - phi2_pred, 'r--', alpha=0.7, label='Pred')
+        axs[4].legend(loc='best', fontsize=8)
+    axs[4].grid(True, alpha=0.3)
+    axs[4].set_xlabel("Time")
+    axs[4].set_ylabel(r"$\phi_1 - \phi_2$")
+    axs[4].set_title("Phase Difference")
+    
+    # axs[5]: 速度差 (v1 - v2)
+    axs[5].plot(times_np, v1_true - v2_true, 'b-', alpha=0.7, label='True')
+    if compare:
+        axs[5].plot(times_np, v1_pred - v2_pred, 'r--', alpha=0.7, label='Pred')
+        axs[5].legend(loc='best', fontsize=8)
+    axs[5].grid(True, alpha=0.3)
+    axs[5].set_xlabel("Time")
+    axs[5].set_ylabel(r"$v_1 - v_2$")
+    axs[5].set_title("Velocity Difference")
+    
+    fig.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=400, bbox_inches='tight', transparent=False)
+        print(f"图表已保存到: {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+
+def plot_phase_space(trajectories, n_samples=100, save_path=None):
+    """
+    绘制相空间图。
+    
+    Args:
+        trajectories: 轨迹 [n_samples, n_steps, 4]
+        n_samples: 要绘制的样本数
+        save_path: 保存路径
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    traj_np = trajectories[:n_samples].numpy() if torch.is_tensor(trajectories) else trajectories[:n_samples]
+    
+    # φ₁ vs v₁
+    ax = axes[0]
+    for i in range(min(n_samples, len(traj_np))):
+        ax.plot(traj_np[i, :, 0], traj_np[i, :, 1], alpha=0.3)
+    ax.set_xlabel(r'$\phi_1$')
+    ax.set_ylabel(r'$v_1$')
+    ax.set_title('Phase Space: Junction 1')
+    ax.grid(True, alpha=0.3)
+    
+    # φ₂ vs v₂
+    ax = axes[1]
+    for i in range(min(n_samples, len(traj_np))):
+        ax.plot(traj_np[i, :, 2], traj_np[i, :, 3], alpha=0.3)
+    ax.set_xlabel(r'$\phi_2$')
+    ax.set_ylabel(r'$v_2$')
+    ax.set_title('Phase Space: Junction 2')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    else:
+        plt.show()
+    
+    plt.close()
+
+
+# =============================================================================
+# 主程序
+# =============================================================================
+
+def main():
+    """
+    主函数: 完整的参数学习流程演示。
+    """
+    # ========================================================================
+    # 配置参数
+    # ========================================================================
+    config = {
+        # 随机种子
+        'seed': 42,
+        
+        # 数据生成参数
+        'n_samples': 1000,        # 样本数量
+        'n_steps': 200,           # 时间步数
+        't_span': [0.0, 100],      # 时间区间
+        'dt': 0.01,               # SDE 积分步长
+        
+        # 真实参数 (用于生成数据)
+        # TODO: consider different coefficients of the two junctions. (i.e. beta1 != beta2, ...)
+        'true_params': {
+            'beta1': 0.1,
+            'beta2': 0.1,
+            'i1': 0.8,
+            'i2': 0.8,
+            'kappa1': 0.05,
+            'kappa2': 0.05,
+            'sigma1': 0.01,
+            'sigma2': 0.01,
+        },
+        
+        # 初始状态
+        'initial_state': torch.tensor([0.0, 0.0, 0.0, 0.0]),
+        
+        # 训练参数
+        'train_ratio': 0.8,
+        'batch_size': 64,         # 减小 batch size 以提高稳定性
+        'n_epochs': 50,
+        'lr': 1e-3,               # 降低学习率以避免 nan
+        
+        # 损失函数配置 (参考 LieTrotterSDE)
+        'loss_config': {
+            'mse_weight': 0.0,           # MSE 损失权重
+            'euler_weight': 1.0,         # Euler-Maruyama 伪似然权重
+            'moment_weight': 1.0,        # 矩匹配损失权重 (降低以避免过大损失)
+            'autocorr_weight': 0.0,      # 自相关损失权重
+            'wasserstein_weight': 0.0,   # Wasserstein 距离权重
+            'kl_weight': 1.0,            # 软直方图 KL 散度损失权重
+            'max_lags': 10,              # 自相关最大滞后阶数
+            'wasserstein_points': 20,    # Wasserstein 采样点数
+            'kl_points': 5,              # KL 散度采样时间点数
+            'kl_bins': 20,               # KL 散度直方图 bin 数
+            'kl_sigma': 0.1,             # KL 散度软分箱带宽
+        },
+        
+        # 梯度裁剪配置
+        'grad_clip': {
+            'enabled': True,             # 是否启用梯度裁剪
+            'max_norm': 10.0,             # 梯度最大范数
+        },
+        
+        # Neural SDE 模型配置
+        'model_config': {
+            'model_type': 'neural',      # 'neural', 'hybrid', or 'parametric'
+            'hidden_dim': 128,           # 神经网络隐藏层维度
+            'num_layers': 5,             # 神经网络层数
+            'activation': 'lipswish',    # 激活函数: 'lipswish', 'tanh', 'relu'
+        }
+    }
+    
+    print("=" * 70)
+    print("Learning SDE of Coupled Josephson Junctions")
+    print("=" * 70)
+    
+    # 设置随机种子
+    seed_everything(config['seed'])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # ========================================================================
+    # 步骤 1: 生成训练数据
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("Step 1: Generating Training Data")
+    print("=" * 70)
+    
+    # 使用真实参数创建模拟器
+    true_sde = JosephsonJunctionSDE(**config['true_params']).to(device)
+    
+    print("Ground Truth Params:")
+    for name, value in config['true_params'].items():
+        print(f"  {name}: {value}")
+    
+    # 生成数据
+    initial_state = config['initial_state'].to(device)
+    times, trajectories = true_sde.simulate(
+        t_span=config['t_span'],
+        n_steps=config['n_steps'],
+        initial_state=initial_state,
+        n_samples=config['n_samples']
+    )
+    
+    print(f"\nTrajectories Generated:", flush=True)
+    print(f"  #Samples    : {config['n_samples']}", flush=True)
+    print(f"  Time Steps  : {config['n_steps']}", flush=True)
+    print(f"  Time Span   : {config['t_span']}", flush=True)
+    print(f"  State Space : 4 [φ₁, v₁, φ₂, v₂]", flush=True)
+    
+    # 绘制真实数据的可视化（使用自身的副本作为对比来展示数据格式）
+    print("\nPlotting Generated Ground Truth Trajectories...")
+    # 为了展示真实数据，我们用自身作为预测来调用对比函数
+    # 这样可以看到数据的原始形态
+    sample_indices = torch.tensor([0, 1, 2])  # 取前3个样本
+    sample_trajs = trajectories[sample_indices]
+    plot_trajectories_comparison(
+        sample_trajs, sample_trajs, times, 
+        n_samples=1,  # 只画第一个样本
+        save_path="true_trajectories_visualization.png"
+    )
+    print("Figure Saved to >>> true_trajectories_visualization.png")
+    
+    # ========================================================================
+    # 步骤 2: 划分训练集和测试集
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("Step 2: Splitting Training and Testing Sets")
+    print("=" * 70)
+    
+    n_train = int(config['n_samples'] * config['train_ratio'])
+    
+    # 随机划分
+    indices = torch.randperm(config['n_samples'])
+    train_indices = indices[:n_train]
+    test_indices = indices[n_train:]
+    
+    train_trajectories = trajectories[train_indices]
+    test_trajectories = trajectories[test_indices]
+    
+    # 创建数据集和数据加载器
+    train_dataset = JosephsonDataset(train_trajectories, times)
+    test_dataset = JosephsonDataset(test_trajectories, times)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
+    
+    print(f"Training Samples: {n_train}")
+    print(f" Testing Samples: {config['n_samples'] - n_train}")
+    
+    # ========================================================================
+    # 步骤 3: 创建 Neural SDE 模型和损失函数
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("Step 3: Constructing Neural SDE Model and Loss Functions")
+    print("=" * 70)
+    
+    # 根据配置创建模型
+    model_type = config['model_config']['model_type']
+    model = NeuralJosephsonSDE(
+        state_dim=4,
+        hidden_dim=config['model_config']['hidden_dim'],
+        num_layers=config['model_config']['num_layers'],
+        activation=config['model_config']['activation']
+    ).to(device)
+    print(f"Neural SDE Model Constructed:")
+    
+    # 计算模型参数数量
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Hidden Dim : {config['model_config']['hidden_dim']}")
+    print(f"  #Layers    : {config['model_config']['num_layers']}")
+    print(f"  Activation : {config['model_config']['activation']}")
+    print(f"  #Params    : {total_params:,}", flush=True)
+    
+    # 创建损失函数
+    loss_fn = LossFunction(
+        mse_weight=config['loss_config']['mse_weight'],
+        euler_weight=config['loss_config']['euler_weight'],
+        moment_weight=config['loss_config']['moment_weight'],
+        autocorr_weight=config['loss_config']['autocorr_weight'],
+        wasserstein_weight=config['loss_config']['wasserstein_weight'],
+        kl_weight=config['loss_config'].get('kl_weight', 0.0),
+        dt=config['dt'],
+        max_lags=config['loss_config']['max_lags'],
+        wasserstein_points=config['loss_config']['wasserstein_points'],
+        kl_points=config['loss_config'].get('kl_points', 5),
+        kl_bins=config['loss_config'].get('kl_bins', 10),
+        kl_sigma=config['loss_config'].get('kl_sigma', 0.1)
+    ).to(device)
+    
+    print("\nLoss Function:")
+    for name, value in config['loss_config'].items():
+        if config['loss_config'][f"{name}"] > 0:
+            print(f"  {name}: {value}")
+    
+    # 打印梯度裁剪配置
+    print("\nGradient Clipping:")
+    for name, value in config['grad_clip'].items():
+        print(f"  {name}: {value}")
+    
+    # ========================================================================
+    # 步骤 4: 训练模型
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("Step 4: Training")
+    print("=" * 70)
+    
+    # TODO: Consider Muon Optimizer.
+    optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.8)
+    
+    # 记录训练历史
+    train_history = []
+    test_history = []
+    grad_norm_history = []
+    
+    for epoch in range(config['n_epochs']):
+        # 训练 (第一个 epoch 开启调试模式)
+        train_losses, avg_grad_norm = train_epoch(
+            model, train_loader, optimizer, times, loss_fn, config['dt'],
+            grad_clip_config=config['grad_clip'],
+            debug=(epoch == 0)
+        )
+        train_history.append(train_losses)
+        grad_norm_history.append(avg_grad_norm)
+        
+        # 评估
+        test_losses, *_ = evaluate(
+            model, test_loader, times, loss_fn, config['dt']
+        )
+        test_history.append(test_losses)
+        
+        # 学习率调整
+        scheduler.step(test_losses['total'])
+        
+        # 打印进度
+        print(f"Epoch {epoch + 1}/{config['n_epochs']} |", end="")
+        print(f" Train Losses |", end="")
+        counter = 0
+        for name, value in train_losses.items():
+            if name != "total" and config['loss_config'].get(f"{name}_weight", 1) > 0:
+                print(f" {name}: {value:.6f} |", end=""); counter += 1
+            if counter > 1:
+                print(f" total: {train_losses['total']:.6f} |", end="")
+        print(f" Test Losses |", end="")
+        for name, value in test_losses.items():
+            if config['loss_config'].get(f"{name}_weight", 1) > 0:
+                print(f" {name}: {value:.6f} |", end="")
+            if counter > 1:
+                print(f" total: {test_losses['total']:.6f} |", end="")
+        print(f" Grad Norm: {avg_grad_norm:.6f} |", end="")
+        print(f" LR: {optimizer.param_groups[0]['lr']:.6f} |", flush=True)
+    
+    # ========================================================================
+    # 步骤 5: 最终评估和可视化
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("Step 5: Evaluation")
+    print("=" * 70)
+    
+    final_test_losses, final_preds, final_trues = evaluate(
+        model, test_loader, times, loss_fn, config['dt']
+    )
+    print(f"Testing Loss:")
+    for name, value in final_test_losses.items():
+        print(f"  {name}: {value:.6f}")
+    
+    # 对于 Neural SDE，我们不直接学习物理参数，而是学习神经网络的权重
+    # 可以保存模型用于后续分析
+    print("\nModel Info:")
+    print(f"  Type     : {config['model_config']['model_type']}")
+    print(f"  #Params  : {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 绘制结果
+    print("\nGenerating Training Trajectory Figure...", flush=True)
+    
+    # 准备训练历史数据
+    loss_names = list(train_history[0].keys())
+    n_losses = len(loss_names) - 1  # 不包括 total
+    
+    # 绘制训练历史
+    if n_losses > 0:
+        fig, axes = plt.subplots(1, n_losses, figsize=(5 * n_losses, 4))
+        if n_losses == 1:
+            axes = [axes]
+        
+        for idx, loss_name in enumerate(loss_names):
+            if loss_name == 'total':
+                continue
+            ax: matplotlib.axes.Axes = axes[idx if idx < n_losses else 0]
+            train_values = [h[loss_name] for h in train_history]
+            test_values = [h[loss_name] for h in test_history]
+            
+            ax.plot(train_values, label=f'Train {loss_name}', alpha=0.7)
+            ax.plot(test_values, label=f'Test {loss_name}', alpha=0.7)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(f'{loss_name} Loss')
+            ax.semilogy()
+            ax.set_title(f'{loss_name} Training History')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig("training_history.png", dpi=150, bbox_inches='tight')
+        print("Training Trajectory Saved to >>> training_history.png")
+        plt.close()
+    
+    # 绘制总损失
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    train_total = [h['total'] for h in train_history]
+    test_total = [h['total'] for h in test_history]
+    ax.plot(train_total, label='Train Total', color='blue', alpha=0.7)
+    ax.plot(test_total, label='Test Total', color='red', alpha=0.7)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Total Loss')
+    ax.set_title('Total Loss Training History')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("training_history_total.png", dpi=150, bbox_inches='tight')
+    print("Total Loss History Saved to >>> training_history_total.png")
+    plt.close()
+    
+    # 绘制轨迹对比 (使用新的 2x3 布局)
+    print("\n绘制真实轨迹 vs 预测轨迹对比...")
+    plot_trajectories_comparison(
+        final_trues, final_preds, times, 
+        n_samples=1,  # 对比函数内部取第一个样本进行详细对比
+        save_path="trajectory_comparison.png",
+        compare=True
+    )
+    
+    # 绘制预测轨迹的相空间
+    print("绘制预测轨迹相空间...")
+    plot_phase_space(final_preds, n_samples=50, save_path="predicted_phase_space.png")
+    
+    # 保存模型
+    model_path = "neural_josephson_sde.pt"
+    torch.save(model.state_dict(), model_path)
+    print(f"\n模型已保存到: {model_path}")
+    
+    print("\n" + "=" * 70)
+    print("Neural SDE 训练完成!")
+    print("=" * 70)
+    
+    return model, train_history, test_history
+
+
+if __name__ == "__main__":
+    model, train_history, test_history = main()
