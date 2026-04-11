@@ -1,3 +1,5 @@
+import tqdm
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -432,7 +434,7 @@ def train_koopman(model, ou_process, n_epochs=400, batch_size=512, dt=0.05,
         # 获取当前权重
         weights = loss_scheduler.get_weights()
         
-        for batch in loader:
+        for batch in tqdm.tqdm(loader):
             traj = batch[0].to(device)
             
             optimizer.zero_grad()
