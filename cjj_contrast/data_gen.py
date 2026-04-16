@@ -139,7 +139,7 @@ class JosephsonJunctionSDE(nn.Module):
         """
         Drift term of SDE
         """
-        phi1, v1, phi2, v2 = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
+        phi1, v1, phi2, v2 = y[..., 0] % (torch.pi * 2), y[..., 1], y[..., 2] % (torch.pi * 2), y[..., 3]
 
         d_phi1 = v1
         dv1 = (self.i1 - self.beta1 * v1 - torch.sin(phi1) + self.kappa1 * (phi2 - phi1))

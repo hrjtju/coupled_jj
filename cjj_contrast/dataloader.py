@@ -21,11 +21,12 @@ class JosephsonJunctionDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
         self.X: np.ndarray = X
         self.X = self.X.reshape(-1, *self.X.shape[2:])
-        self.Y: np.ndarray = y.reshape(-1, *self.Y.shape[2:])
+        self.Y: np.ndarray = y
+        self.Y = self.Y.reshape(-1, *self.Y.shape[2:])
         
-        assert self.X.ndim == 4
-        assert self.Y.ndim == 3
-        assert self.X.shape[:1] == self.Y.shape[:1]
+        assert self.X.ndim == 3, self.X.ndim
+        assert self.Y.ndim == 2, self.Y.ndim
+        assert self.X.shape[0] == self.Y.shape[0]
     
     def __len__(self):
         return len(self.X)

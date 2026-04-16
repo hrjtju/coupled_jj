@@ -54,7 +54,7 @@ class FeatureExtractor(nn.Module):
 
     def __init__(self, in_dim: int, hidden_dim: int, n_layer: int,
                  out_dim: int = 256, activation: str = 'elu', 
-                 nhead: int = 5, dropout: float = 0.1):
+                 nhead: int = 8, dropout: float = 0.1):
         
         super().__init__()
 
@@ -71,7 +71,7 @@ class FeatureExtractor(nn.Module):
         # Part 1: Transformer Encoder with Positional Encoding
         # 输入投影层：将 in_dim 映射到 hidden_dim
         self.conv1 = nn.Conv1d(4, in_dim, kernel_size=3, stride=2, padding=0)
-        
+        self.bn = nn.BatchNorm1d(in_dim)
         self.input_projection = nn.Linear(in_dim, hidden_dim)
         
         # 位置编码
@@ -95,7 +95,7 @@ class FeatureExtractor(nn.Module):
         # Layer Normalization (Transformer 后的归一化)
         self.layer_norm = nn.LayerNorm(hidden_dim)
         
-        input_t = torch.randn((1, 1000, 4))
+        input_t = torch.randn((1, 2000, 4))
         x_conv = self.input_projection(self.conv1(input_t.transpose(1, 2).float()).transpose(1, 2))
         t_dim = x_conv.shape[1] * x_conv.shape[2]
         self.down_proj = nn.Linear(t_dim, out_dim)
@@ -133,7 +133,7 @@ class FeatureExtractor(nn.Module):
         # 1. 输入投影: [batch, seq_len, in_dim] -> [batch, seq_len, hidden_dim]
         
         b, l, c = x.shape
-        x_conv = self.conv1(x.transpose(1, 2).float())
+        x_conv = self.bn(self.conv1(x.transpose(1, 2).float()))
         x_input = self.input_projection(x_conv.transpose(1, 2))
         
         # 2. 添加位置编码
@@ -163,16 +163,15 @@ class ParamPredictor(nn.Module):
                 self.linears.append(nn.Linear(in_dim, hid_dim))
             else:
                 self.linears.append(nn.Linear(hid_dim, hid_dim))
-            self.linears.append(nn.ELU())
+            self.linears.append(nn.ELU(inplace=True))
         
         # 输出层
         self.linears.append(nn.Linear(hid_dim, n_params))
-        self.normalization = nn.Tanh()
     
     def forward(self, x: Tensor):
         for layer in self.linears:
             x = layer(x)
-        return self.normalization(x)
+        return x
 
 if __name__ == "__main__":
     # test the classes and functions.
