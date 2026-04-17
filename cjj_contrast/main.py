@@ -12,6 +12,7 @@ train_loader, test_loader = create_dataloaders(batchsize=32)
 
 # 初始化 FeatureExtractor
 extractor = FeatureExtractor(in_dim=64, hidden_dim=64, n_layer=5, out_dim=128)
+
 predictor = ParamPredictor(in_dim=128, hid_dim=128, n_params=8)
 
 # 对比学习训练
