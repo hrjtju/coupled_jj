@@ -47,6 +47,31 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class FourierFeatureEncoder(nn.Module):
+    def __init__(self, n_frequencies=32):
+        super().__init__()
+        
+        # 对相位变量使用随机傅里叶特征
+        self.B = (torch.randn(2, n_frequencies) * 2 * torch.pi).cuda()  # 2个相位
+        
+    def forward(self, traj):
+        phi = traj[..., [0, 2]].cuda()  # phi1, phi2
+        v = traj[..., [1, 3]].cuda()    # v1, v2
+        
+        # print(traj.shape)
+        # print(phi.shape)
+        
+        # Fourier嵌入: [sin(2π B phi), cos(2π B phi)]
+        mul = phi @ self.B
+        phi_proj = torch.cat([torch.sin(mul), 
+                              torch.cos(mul)], dim=-1)
+        
+        # print(phi_proj.shape)
+        # print(torch.cat([phi_proj, v], dim=-1).shape)
+        
+        # 与电压拼接后送入Transformer
+        return torch.cat([phi_proj, v], dim=-1)
+
 class FeatureExtractor(nn.Module):
     """
     FeatureExtractor
@@ -70,9 +95,10 @@ class FeatureExtractor(nn.Module):
 
         # Part 1: Transformer Encoder with Positional Encoding
         # 输入投影层：将 in_dim 映射到 hidden_dim
-        self.conv1 = nn.Conv1d(4, in_dim, kernel_size=3, stride=2, padding=0)
-        self.bn = nn.BatchNorm1d(in_dim)
-        self.input_projection = nn.Linear(in_dim, hidden_dim)
+        self.fourier_feature = FourierFeatureEncoder().cuda()
+        self.conv1 = nn.Conv1d(66, in_dim, kernel_size=3, stride=2, padding=0).cuda()
+        self.bn = nn.BatchNorm1d(in_dim).cuda()
+        self.input_projection = nn.Linear(in_dim, hidden_dim).cuda()
         
         # 位置编码
         self.pos_encoder = PositionalEncoding(hidden_dim, max_len=5000, dropout=dropout)
@@ -95,8 +121,8 @@ class FeatureExtractor(nn.Module):
         # Layer Normalization (Transformer 后的归一化)
         self.layer_norm = nn.LayerNorm(hidden_dim)
         
-        input_t = torch.randn((1, 2000, 4))
-        x_conv = self.input_projection(self.conv1(input_t.transpose(1, 2).float()).transpose(1, 2))
+        input_t = torch.randn((1, 2000, 4)).cuda()
+        x_conv = self.input_projection(self.conv1(self.fourier_feature(input_t).transpose(1, 2).float()).transpose(1, 2))
         t_dim = x_conv.shape[1] * x_conv.shape[2]
         self.down_proj = nn.Linear(t_dim, out_dim)
         
@@ -133,7 +159,7 @@ class FeatureExtractor(nn.Module):
         # 1. 输入投影: [batch, seq_len, in_dim] -> [batch, seq_len, hidden_dim]
         
         b, l, c = x.shape
-        x_conv = self.bn(self.conv1(x.transpose(1, 2).float()))
+        x_conv = self.bn(self.conv1(self.fourier_feature(x).transpose(1, 2).float()))
         x_input = self.input_projection(x_conv.transpose(1, 2))
         
         # 2. 添加位置编码

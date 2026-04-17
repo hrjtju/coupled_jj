@@ -47,60 +47,125 @@ class WeightedL1Loss(nn.Module):
 
 class SupConLoss(nn.Module):
     """
-    有监督对比学习损失 (Supervised Contrastive Loss)。
-    使用参数标签 y 来定义正样本对（相同参数配置的轨迹）和负样本对。
+    物理感知对比损失：参数越近，越倾向于拉近；
+    但动力学行为不同时，即使参数相同也推开（处理多稳态）
     """
-    def __init__(self, temperature: float = 0.1):
+    def __init__(self, temperature: float = 0.1, 
+                 param_scales: torch.Tensor = None,
+                 psd_weight: float = 0.3):
         super().__init__()
         self.temperature = temperature
-
-    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        self.psd_weight = psd_weight  # 功率谱特征的权重
+        
+        # 各参数的物理尺度（用于归一化距离）
+        # 例如：i∈[0,2], β∈[0,1], κ∈[0,0.2], σ∈[0,0.05]
+        self.register_buffer('param_scales', param_scales or torch.ones(1))
+        
+    def compute_kinematic_similarity(self, traj_i, traj_j):
+        """
+        计算两条轨迹的动力学相似度（0-1之间，1表示完全相同）
+        输入: [T, 4] 的轨迹 (phi1, v1, phi2, v2)
+        """
+        with torch.no_grad():  # 不梯度回传，作为软标签
+            # 1. 平均电压（Running/Trapped 态的关键区分）
+            v_mean_i = traj_i[:, [1, 3]].mean(dim=0)  # [v1_mean, v2_mean]
+            v_mean_j = traj_j[:, [1, 3]].mean(dim=0)
+            v_sim = torch.exp(-torch.norm(v_mean_i - v_mean_j) / 0.5)
+            
+            # 2. 功率谱密度相似度（Bursting/周期/混沌的区分）
+            # 使用周期图法快速估计PSD
+            psd_i = self._compute_psd(traj_i[:, [1, 3]])  # 基于电压
+            psd_j = self._compute_psd(traj_j[:, [1, 3]])
+            psd_sim = torch.exp(-torch.norm(psd_i - psd_j) / (torch.norm(psd_i) + 1e-8))
+            
+            # 3. 相位缠绕数（区分旋转与静止）
+            winding_i = self._compute_winding_number(traj_i[:, [0, 2]])
+            winding_j = self._compute_winding_number(traj_j[:, [0, 2]])
+            winding_sim = (winding_i == winding_j).float()
+            
+            # 综合相似度（可调整权重）
+            total_sim = 0.4 * v_sim + 0.4 * psd_sim + 0.2 * winding_sim
+            return total_sim
+    
+    def _compute_psd(self, voltage_signal):
+        """快速功率谱密度估计（使用FFT）"""
+        # voltage_signal: [T, 2]
+        T = voltage_signal.shape[0]
+        # Hann窗减少频谱泄漏
+        window = torch.hann_window(T, device=voltage_signal.device).unsqueeze(1)
+        signal = voltage_signal * window
+        
+        # FFT并计算功率谱
+        fft = torch.fft.rfft(signal, dim=0)
+        psd = torch.abs(fft)**2
+        # 只保留低频部分（约瑟夫森结动力学通常在特定频段）
+        return psd[:T//10].flatten()  # 取前10%频段
+    
+    def _compute_winding_number(self, phase_signal):
+        """计算相位缠绕数（检测 2π 跳变）"""
+        # phase_signal: [T, 2]
+        delta = torch.diff(phase_signal, dim=0)
+        # 检测 2π 跳变（考虑周期性）
+        jumps = torch.abs(delta) > torch.pi
+        winding = (delta / (2 * torch.pi)).sum(dim=0)
+        return torch.round(winding).abs()
+    
+    def forward(self, features: torch.Tensor, 
+                labels: torch.Tensor,
+                trajectories: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
-            features: [batch_size, feature_dim] 特征向量
-            labels: [batch_size, n_params] 参数标签，用于判断正负样本对
-        Returns:
-            loss: 标量损失
+            features: [B, D] 嵌入特征
+            labels: [B, n_params] 参数标签
+            trajectories: [B, T, 4] 原始轨迹（用于计算动力学相似度）
         """
         device = features.device
         batch_size = features.shape[0]
         
-        # L2 归一化特征
         features = F.normalize(features, dim=1)
         
-        # 统一 label 形状为 [batch_size, n_params]
-        if labels.dim() > 2:
-            labels = labels.view(batch_size, -1)
-        elif labels.dim() == 2 and labels.shape[-1] == 1:
-            labels = labels.squeeze(-1)
-        
-        # 计算余弦相似度矩阵 [B, B]
-        similarity_matrix = torch.matmul(features, features.T) / self.temperature
-        
-        # 正样本 mask：参数完全相同的样本对
+        # 参数距离矩阵 [B, B]
         labels_i = labels.unsqueeze(1)  # [B, 1, n_params]
         labels_j = labels.unsqueeze(0)  # [1, B, n_params]
-        mask = torch.all(torch.abs(labels_i - labels_j) < 1e-6, dim=2).float().to(device)
+        
+        # 归一化参数距离（考虑各参数物理尺度）
+        param_diff = torch.abs(labels_i - labels_j) / self.param_scales.to(device)
+        param_dist = torch.norm(param_diff, dim=2)  # [B, B]
+        
+        # 软正样本权重：参数越近权重越高（高斯核）
+        # 但同时需要考虑动力学行为
+        if trajectories is not None:
+            # 计算动力学相似度矩阵（较慢，只在训练后期或每隔几步计算）
+            kin_sim = torch.zeros(batch_size, batch_size, device=device)
+            for i in range(batch_size):
+                for j in range(i+1, batch_size):
+                    sim = self.compute_kinematic_similarity(trajectories[i], trajectories[j])
+                    kin_sim[i, j] = sim
+                    kin_sim[j, i] = sim
+            
+            # 最终相似度权重：参数相近且动力学相似 -> 高权重正样本
+            # 参数相近但动力学不同（多稳态）-> 低权重（视为负样本）
+            mask_pos_weight = torch.exp(-param_dist / 0.1) * kin_sim
+        else:
+            # 退化为纯参数距离（训练初期使用，更快）
+            mask_pos_weight = torch.exp(-param_dist / 0.1)
+        
+        # 计算对比损失（Soft InfoNCE）
+        similarity_matrix = torch.matmul(features, features.T) / self.temperature
+        exp_sim = torch.exp(similarity_matrix)
         
         # 排除自身
-        mask_self = torch.eye(batch_size, device=device)
-        mask_pos = mask - mask_self
+        mask_self = torch.eye(batch_size, device=device).bool()
+        exp_sim = exp_sim.masked_fill(mask_self, 0)
         
-        # 计算 exp(similarity)，排除自身
-        exp_sim = torch.exp(similarity_matrix) * (1 - mask_self)
+        # 分子：加权正样本
+        pos_weighted = (exp_sim * mask_pos_weight).sum(dim=1)
         
-        # 分子：正样本的相似度之和
-        pos_sum = (exp_sim * mask_pos).sum(dim=1)
-        
-        # 分母：所有样本的相似度之和
+        # 分母：所有样本
         denom = exp_sim.sum(dim=1)
         
-        # 只对存在正样本的 anchor 计算损失
-        valid = (mask_pos.sum(dim=1) > 0).float()
-        loss = -torch.log(pos_sum / (denom + 1e-8) + 1e-8)
-        loss = (loss * valid).sum() / (valid.sum() + 1e-8)
-        
-        return loss
+        loss = -torch.log((pos_weighted + 1e-8) / (denom + 1e-8))
+        return loss.mean()
 
 
 def train(models, train_loader, optimizer=None, epochs: int = 10, 
@@ -202,6 +267,24 @@ def train(models, train_loader, optimizer=None, epochs: int = 10,
         avg_loss = total_loss / max(num_batches, 1)
         print(f"Epoch {epoch+1}/{epochs}, Average Loss: {avg_loss:.4f}")
         wandb.log({"train/regression_loss": avg_loss, "epoch": epochs + epoch})
+    
+    # 训练结束后绘制训练集上的参数预测对比图
+    extractor.eval()
+    predictor.eval()
+    train_preds = []
+    train_trues = []
+    with torch.no_grad():
+        for x, y in tqdm(train_loader, desc="Collecting train predictions"):
+            x = x.to(device)
+            features = extractor(x)
+            preds = predictor(features)
+            train_preds.append(preds.cpu())
+            train_trues.append(y.cpu())
+    
+    train_preds = torch.cat(train_preds, dim=0).numpy()
+    train_trues = torch.cat(train_trues, dim=0).numpy()
+    train_fig = plot_parameter_predictions(train_preds, train_trues, save_path="train_parameter_predictions.png")
+    wandb.log({"train_parameter_predictions": wandb.Image(train_fig)})
     
     return extractor, predictor
 
