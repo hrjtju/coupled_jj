@@ -91,7 +91,7 @@ ax0.plot(ts_np, np.sin(phi2_w), label='φ₂', color='#ff7f0e', alpha=0.8, linew
 ax0.set_title('Phase Trajectories [-π, π]', fontsize=14, fontweight='bold')
 ax0.set_xlabel('Time t')
 ax0.set_xlim(0, T/10)
-ax0.set_ylabel('$\sin(\phi)$')
+ax0.set_ylabel(r'$\sin(\phi)$')
 ax0.legend()
 # ax0.set_ylim([-1.1, 1.1])
 ax0.grid(True, alpha=0.3)
@@ -107,10 +107,10 @@ ax1.legend()
 ax1.grid(True, alpha=0.3)
 
 ax2 = fig.add_subplot(gs[0, 2])
-ax2.scatter(np.sin(phi1_w), v1, c=ts_np, cmap='Blues', s=1, alpha=0.8, label='JJ 1')
-ax2.scatter(np.sin(phi2_w), v2, c=ts_np, cmap='Oranges', s=1, alpha=0.8, label='JJ 2')
+ax2.scatter(np.sin(phi1_w), v1, s=1, alpha=0.8, label='JJ 1')
+ax2.scatter(np.sin(phi2_w), v2, s=1, alpha=0.8, label='JJ 2')
 ax2.set_title('Phase-Space (φ vs v)', fontsize=14, fontweight='bold')
-ax2.set_xlabel('Phase \sin(\phi)')
+ax2.set_xlabel(r'Phase $\sin(\phi)$')
 ax2.set_ylabel('Velocity v')
 # ax2.set_xlim([-1.1, 1.1])
 ax2.legend()
@@ -118,15 +118,15 @@ ax2.grid(True, alpha=0.3)
 
 # ========== 第1行：2D图4-5 + 空位 ==========
 ax3 = fig.add_subplot(gs[1, 0])
-ax3.plot(phi1_w, phi2_w, color='#9467bd', alpha=0.6, linewidth=1)
+ax3.plot(np.sin(phi1_w), np.sin(phi2_w), color='#9467bd', alpha=0.6, linewidth=1)
 ax3.scatter(np.sin(phi1_w[0]), np.sin(phi2_w[0]), color='green', s=80, marker='o', 
            label='Start', zorder=5, edgecolors='black')
 ax3.scatter(np.sin(phi1_w[-1]), np.sin(phi2_w[-1]), color='red', s=80, marker='s', 
            label='End', zorder=5, edgecolors='black')
 ax3.plot([-1.1, 1.1], [-1.1, 1.1], 'k--', alpha=0.3, linewidth=1, label='Sync')
 ax3.set_title('Phase-Phase Relationship', fontsize=14, fontweight='bold')
-ax3.set_xlabel('\sin(\phi_1)')
-ax3.set_ylabel('\sin(\phi_2)')
+ax3.set_xlabel(r'$\sin(\phi_1)$')
+ax3.set_ylabel(r'$\sin(\phi_2)$')
 # ax3.set_xlim([-1.1, 1.1])
 # ax3.set_ylim([-1.1, 1.1])
 ax3.legend(fontsize=8)
@@ -191,14 +191,13 @@ ax5 = fig.add_subplot(gs[2, 0], projection='3d')
 ax5.plot_surface(x_grid, y_grid, z_grid, alpha=0.08, color='lightgray', 
                 linewidth=0, antialiased=False, rstride=1, cstride=1)
 # 使用Line3DCollection绘制轨迹（RdBu颜色映射）
-lc = Line3DCollection(segments, cmap='RdBu', alpha=[i/len(segments) for i in range(len(segments))], linewidth=1)
-lc.set_array(ts_np)
+lc = Line3DCollection(segments, cmap='RdBu', alpha=[0.2 + 0.6*i/len(segments) for i in range(len(segments))], linewidth=1)
+lc.set_array(ts_np[:-1])
 ax5.add_collection3d(lc)
 ax5.scatter(x_torus[0], y_torus[0], z_torus[0], color='green', s=150, marker='o', 
            edgecolors='black', linewidth=2, zorder=10)
 ax5.scatter(x_torus[-1], y_torus[-1], z_torus[-1], color='red', s=150, marker='s', 
            edgecolors='black', linewidth=2, zorder=10)
-ax5.plot(x_sync, y_sync, z_sync, 'k--', alpha=0.9, linewidth=1, label='Sync line', zorder=20)
 ax5.set_xlim([-3, 3])
 ax5.set_ylim([-3, 3])
 ax5.set_zlim([-0.5, 0.5])
@@ -209,14 +208,13 @@ ax5.set_axis_off()
 ax6 = fig.add_subplot(gs[2, 1], projection='3d')
 ax6.plot_surface(x_grid, y_grid, z_grid, alpha=0.08, color='lightgray', linewidth=0)
 segments_top = np.concatenate([points[:-1], points[1:]], axis=1)
-lc_top = Line3DCollection(segments_top, cmap='RdBu', alpha=[i/len(segments_top) for i in range(len(segments_top))], linewidth=1)
-lc_top.set_array(ts_np)
+lc_top = Line3DCollection(segments_top, cmap='RdBu', alpha=[0.2 + 0.6*i/len(segments_top) for i in range(len(segments_top))], linewidth=1)
+lc_top.set_array(ts_np[:-1])
 ax6.add_collection3d(lc_top)
 ax6.scatter(x_torus[0], y_torus[0], z_torus[0], color='green', s=150, marker='o', 
            edgecolors='black', linewidth=2, zorder=10)
 ax6.scatter(x_torus[-1], y_torus[-1], z_torus[-1], color='red', s=150, marker='s', 
            edgecolors='black', linewidth=2, zorder=10)
-ax6.plot(x_sync, y_sync, z_sync, 'k--', alpha=0.9, linewidth=1, zorder=20)
 ax6.view_init(elev=90, azim=-90)
 ax6.set_xlim([-3, 3])
 ax6.set_ylim([-3, 3])
@@ -228,14 +226,13 @@ ax6.set_axis_off()
 ax7 = fig.add_subplot(gs[2, 2], projection='3d')
 ax7.plot_surface(x_grid, y_grid, z_grid, alpha=0.08, color='lightgray', linewidth=0)
 segments_side = np.concatenate([points[:-1], points[1:]], axis=1)
-lc_side = Line3DCollection(segments_side, cmap='RdBu', alpha=[i/len(segments_side) for i in range(len(segments_side))], linewidth=1)
-lc_side.set_array(ts_np)
+lc_side = Line3DCollection(segments_side, cmap='RdBu', alpha=[0.2 + 0.6*i/len(segments_side) for i in range(len(segments_side))], linewidth=1)
+lc_side.set_array(ts_np[:-1])
 ax7.add_collection3d(lc_side)
 ax7.scatter(x_torus[0], y_torus[0], z_torus[0], color='green', s=150, marker='o', 
            edgecolors='black', linewidth=2, zorder=10)
 ax7.scatter(x_torus[-1], y_torus[-1], z_torus[-1], color='red', s=150, marker='s', 
            edgecolors='black', linewidth=2, zorder=10)
-ax7.plot(x_sync, y_sync, z_sync, 'k--', alpha=0.9, linewidth=1, zorder=20)
 ax7.view_init(elev=0, azim=0)
 ax7.set_xlim([-3, 3])
 ax7.set_ylim([-3, 3])
@@ -252,42 +249,3 @@ plt.close()
 
 print("All 8 plots arranged in 3x3 grid with updated 3D torus visualization.")
 
-
-"""
-@dynamics_analysis/draw_coupledjj.py 帮我检查代码的问题。报错信息如下：
-
-Traceback (most recent call last):
-  File "D:\projects\coupled_jj\dynamics_analysis\draw_coupledjj.py", line 249, in <module>
-    plt.savefig('coupled_oscillators_complete.png', dpi=300,
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\pyplot.py", line 1250, in savefig
-    res = fig.savefig(*args, **kwargs)  # type: ignore[func-returns-value]
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\figure.py", line 3490, in savefig
-    self.canvas.print_figure(fname, **kwargs)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\backend_bases.py", line 2157, in print_figure
-    self.figure.draw(renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\artist.py", line 94, in draw_wrapper
-    result = draw(artist, renderer, *args, **kwargs)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\artist.py", line 71, in draw_wrapper
-    return draw(artist, renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\figure.py", line 3257, in draw
-    mimage._draw_list_compositing_images(
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\image.py", line 134, in _draw_list_compositing_images
-    a.draw(renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\artist.py", line 71, in draw_wrapper
-    return draw(artist, renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\mpl_toolkits\mplot3d\axes3d.py", line 470, in draw
-    super().draw(renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\artist.py", line 71, in draw_wrapper
-    return draw(artist, renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\axes\_base.py", line 3226, in draw
-    mimage._draw_list_compositing_images(
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\image.py", line 134, in _draw_list_compositing_images
-    a.draw(renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\artist.py", line 71, in draw_wrapper
-    return draw(artist, renderer)
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\collections.py", line 358, in draw
-    self.update_scalarmappable()
-  File "D:\projects\coupled_jj\.venv\lib\site-packages\matplotlib\collections.py", line 913, in update_scalarmappable
-    raise ValueError(
-ValueError: Data array shape, (15000,) is incompatible with alpha array shape, (14999,). This can occur with the deprecated behavior of the "flat" shading option, in which a row and/or column of the data array is dropped.
-"""
